@@ -1,0 +1,17 @@
+# 山地天文台标定包安装器：纯前端 SPA（web）+ 一次性验收（verify）
+services:
+  web:
+    build: .
+    image: calibration-updater-web
+    ports:
+      # 宿主端口由环境变量 WEB_PORT 覆盖，默认 8080
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    image: calibration-updater-verify
+    # 一次性验收：跑完 Vitest + Playwright 即退出
+    restart: "no"

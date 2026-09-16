@@ -1,0 +1,9 @@
+# 一次性验收镜像：Vitest（fake-indexeddb 真实事务语义）+ Playwright（真实浏览器持久化链路）
+# 基础镜像自带与 @playwright/test@1.49.1 匹配的 Chromium 及系统依赖
+FROM mcr.microsoft.com/playwright:v1.49.1-noble
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+# 运行 Vitest，再由 Playwright webServer 自动构建并预览产物后执行端到端测试
+CMD ["npm", "run", "verify"]
