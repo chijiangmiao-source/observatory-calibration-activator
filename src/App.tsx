@@ -124,6 +124,8 @@ export default function App() {
           setProgress({ done: e.index + 1, total: e.total });
           if (e.action === 'reused') {
             appendLog('info', `块 ${e.index} 复验通过，跳过写入`);
+          } else if (e.action === 'verified') {
+            appendLog('info', `块 ${e.index} 复验通过（当前版本，无需写入）`);
           } else if (e.action === 'rewritten') {
             appendLog('info', `块 ${e.index} 已损坏，重新写入检查点`);
           } else {
@@ -138,7 +140,7 @@ export default function App() {
         );
         resetFileInputs();
       } else if (outcome.status === 'already-active') {
-        appendLog('info', `版本 ${outcome.version} 已是当前激活版本，未生成第二份记录`);
+        appendLog('info', `版本 ${outcome.version} 已是当前激活版本：载荷复验通过，未生成第二份记录`);
       } else {
         appendLog('info', `故障注入：块 ${outcome.afterChunk} 提交后刷新页面`);
       }

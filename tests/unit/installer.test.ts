@@ -186,16 +186,63 @@ describe('安装引擎：损坏报告与整包校验', () => {
 });
 
 describe('安装引擎：重复安装与旧版本可见性', () => {
-  it('重复安装同一激活版本直接短路，不产生第二份记录', async () => {
+  it('重复安装同一激活版本：完整复验后短路，不产生第二份记录', async () => {
     const { manifest, payload } = await makePackage('v7.0.0', makePayload(31, CHUNK_SIZE));
     const first = await install(store, { manifest, payload });
     expect(first.status).toBe('installed');
 
-    const again = await install(store, { manifest, payload });
+    const events: ChunkEvent[] = [];
+    const again = await install(store, { manifest, payload, onChunk: (e) => events.push(e) });
     expect(again).toEqual({ status: 'already-active', version: 'v7.0.0' });
+    // 复验事件逐块发出，但不产生任何写入
+    expect(events.map((e) => e.action)).toEqual(['verified']);
     expect(await store.listPackageVersions()).toEqual(['v7.0.0']);
     expect(await store.countChunks()).toBe(0);
     expect(await store.getStaging()).toBeNull();
+  });
+
+  it('重复安装时载荷损坏：按最小编号报告，而非显示已激活', async () => {
+    const bytes = makePayload(33, FOUR_CHUNKS);
+    const { manifest, payload } = await makePackage('v7.1.0', bytes);
+    await install(store, { manifest, payload });
+
+    // 第 1、3 块损坏的同名载荷
+    const corrupt = makePayload(33, FOUR_CHUNKS);
+    corrupt[CHUNK_SIZE + 1] ^= 0xff;
+    corrupt[3 * CHUNK_SIZE + 1] ^= 0xff;
+
+    const before = await snapshot(store);
+    const err = await install(store, { manifest, payload: new Blob([corrupt]) }).catch((e) => e);
+    expect(err).toBeInstanceOf(InstallError);
+    expect((err as InstallError).code).toBe('CHUNK_CORRUPT');
+    expect((err as InstallError).chunkIndex).toBe(1);
+    expect((err as InstallError).message).toContain('分块 1 校验失败');
+    // 现场未被改写
+    expect(await snapshot(store)).toEqual(before);
+  });
+
+  it('重复安装时整包散列与清单不符：拒绝且不显示已激活', async () => {
+    const { manifest, payload } = await makePackage('v7.2.0', makePayload(35, CHUNK_SIZE));
+    await install(store, { manifest, payload });
+
+    const tampered = { ...manifest, sha256: 'f'.repeat(64) };
+    const err = await install(store, { manifest: tampered, payload }).catch((e) => e);
+    // 清单 sha256 与已安装记录不同 → 版本冲突，拒绝覆盖
+    expect((err as InstallError).code).toBe('VERSION_CONFLICT');
+    expect(await store.getActiveVersion()).toBe('v7.2.0');
+    expect(await store.listPackageVersions()).toEqual(['v7.2.0']);
+  });
+
+  it('同版本不同内容：拒绝覆盖已安装记录', async () => {
+    const v1 = await makePackage('v7.3.0', makePayload(37, CHUNK_SIZE));
+    await install(store, { manifest: v1.manifest, payload: v1.payload });
+
+    const impostor = await makePackage('v7.3.0', makePayload(38, CHUNK_SIZE));
+    const before = await snapshot(store);
+    const err = await install(store, { manifest: impostor.manifest, payload: impostor.payload }).catch((e) => e);
+    expect((err as InstallError).code).toBe('VERSION_CONFLICT');
+    expect((err as InstallError).message).toContain('拒绝覆盖');
+    expect(await snapshot(store)).toEqual(before);
   });
 
   it('新版本暂存/安装失败期间旧激活版本保持可见', async () => {
@@ -222,5 +269,60 @@ describe('安装引擎：重复安装与旧版本可见性', () => {
     expect(await store.getActiveVersion()).toBe('v8.1.0');
     // 旧包记录仍保留（历史可见），active 唯一
     expect((await store.listPackageVersions()).sort()).toEqual(['v8.0.0', 'v8.1.0']);
+  });
+});
+
+describe('安装引擎：故障注入编号校验', () => {
+  it('单块包设为第 1 块时提示编号不存在，且不写入任何数据', async () => {
+    const { manifest, payload } = await makePackage('v9.0.0', makePayload(51, CHUNK_SIZE)); // 仅第 0 块
+    let reloads = 0;
+    const err = await install(store, {
+      manifest,
+      payload,
+      crashAfterChunk: 1,
+      onReload: () => reloads++,
+    }).catch((e) => e);
+
+    expect(err).toBeInstanceOf(InstallError);
+    expect((err as InstallError).code).toBe('INVALID_CRASH_CHUNK');
+    expect((err as InstallError).message).toContain('第 1 块不存在');
+    expect((err as InstallError).message).toContain('共 1 块');
+    expect(reloads).toBe(0);
+    expect(await snapshot(store)).toEqual({
+      active: null,
+      staging: null,
+      chunkCount: 0,
+      packageVersions: [],
+    });
+  });
+
+  it.each([
+    ['等于块数', 4],
+    ['远超块数', 99],
+    ['负数', -1],
+    ['非整数', 1.5],
+  ])('4 块包故障编号无效：%s（%i）', async (_label, n) => {
+    const { manifest, payload } = await makePackage('v9.1.0', makePayload(53, FOUR_CHUNKS));
+    const err = await install(store, { manifest, payload, crashAfterChunk: n, onReload: () => {} }).catch((e) => e);
+    expect((err as InstallError).code).toBe('INVALID_CRASH_CHUNK');
+    expect((err as InstallError).message).toContain('故障注入编号无效');
+    expect(await store.countChunks()).toBe(0);
+    expect(await store.getStaging()).toBeNull();
+    expect(await store.getActiveVersion()).toBeNull();
+  });
+
+  it('有效编号（最后一块）仍正常触发刷新', async () => {
+    const { manifest, payload } = await makePackage('v9.2.0', makePayload(59, FOUR_CHUNKS));
+    let reloads = 0;
+    const outcome = await install(store, {
+      manifest,
+      payload,
+      crashAfterChunk: 3,
+      onReload: () => reloads++,
+    });
+    expect(outcome).toEqual({ status: 'reloading', afterChunk: 3 });
+    expect(reloads).toBe(1);
+    expect(await store.countChunks()).toBe(4);
+    expect(await store.getActiveVersion()).toBeNull();
   });
 });

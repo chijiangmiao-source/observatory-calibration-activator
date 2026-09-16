@@ -2,12 +2,15 @@
  * 崩溃可恢复的安装引擎。
  *
  * 协议：
- *  1. 校验载荷文件大小与清单一致；
+ *  1. 校验载荷文件大小与清单一致；故障注入编号必须指向真实存在的分块；
  *  2. 已有暂存时，若 version / payloadSize / sha256 任一不符则拒绝混用且不改写现场；
  *  3. 逐块处理（编号从 0 起）：已暂存块复验通过则跳过；缺失或损坏块从载荷
  *     重新切块、校验散列，通过后才以独立事务写入检查点；
  *  4. 全部块就绪后组包并校验整包 SHA-256；
  *  5. 仅在整包散列通过时，于一个事务内写入包记录、切换唯一 active 指针并清除暂存。
+ *
+ * 重复安装当前激活版本：不写入任何数据，但对所选载荷做完整复验——
+ * 分块损坏按最小编号报告，整包散列不符同样拒绝；同版本不同内容拒绝覆盖。
  *
  * 故障注入：crashAfterChunk = N 时，第 N 块检查点完成后调用 onReload（页面刷新），
  * 模拟供电切换导致的浏览器关闭。
@@ -19,6 +22,8 @@ import type { Store } from './db';
 
 export type InstallErrorCode =
   | 'SIZE_MISMATCH'
+  | 'INVALID_CRASH_CHUNK'
+  | 'VERSION_CONFLICT'
   | 'STAGING_CONFLICT'
   | 'CHUNK_CORRUPT'
   | 'PACKAGE_HASH_MISMATCH'
@@ -38,7 +43,8 @@ export class InstallError extends Error {
 export interface ChunkEvent {
   index: number;
   total: number;
-  action: 'reused' | 'written' | 'rewritten';
+  /** reused=暂存复验通过；written=新写；rewritten=损坏重写；verified=当前版本复验（不写入） */
+  action: 'reused' | 'written' | 'rewritten' | 'verified';
 }
 
 export type InstallOutcome =
@@ -55,6 +61,26 @@ export interface InstallOptions {
   onChunk?: (e: ChunkEvent) => void;
 }
 
+/** 从载荷切出第 index 块并计算 SHA-256。 */
+async function hashPayloadChunk(
+  payload: Blob,
+  index: number,
+  payloadSize: number,
+): Promise<{ buf: ArrayBuffer; hash: string }> {
+  const start = index * CHUNK_SIZE;
+  const end = Math.min(start + CHUNK_SIZE, payloadSize);
+  const buf = await payload.slice(start, end).arrayBuffer();
+  return { buf, hash: await sha256Hex(buf) };
+}
+
+function corruptChunkError(index: number, expected: string, actual: string): InstallError {
+  return new InstallError(
+    'CHUNK_CORRUPT',
+    `分块 ${index} 校验失败（最小损坏编号）：期望 ${expected}，实际 ${actual}`,
+    index,
+  );
+}
+
 export async function install(store: Store, opts: InstallOptions): Promise<InstallOutcome> {
   const { manifest, payload } = opts;
 
@@ -65,10 +91,46 @@ export async function install(store: Store, opts: InstallOptions): Promise<Insta
     );
   }
 
-  // 重复安装同一激活版本：直接短路，不产生第二份记录
+  const total = expectedChunkCount(manifest.payloadSize);
+
+  // 故障注入编号必须指向真实存在的分块，否则静默不刷新会掩盖测试意图
+  const crash = opts.crashAfterChunk;
+  if (crash != null && (!Number.isInteger(crash) || crash < 0 || crash >= total)) {
+    throw new InstallError(
+      'INVALID_CRASH_CHUNK',
+      total === 0
+        ? `故障注入编号无效：载荷共 0 块，不存在第 ${crash} 块`
+        : `故障注入编号无效：第 ${crash} 块不存在（共 ${total} 块，有效编号 0–${total - 1}）`,
+    );
+  }
+
+  // 当前激活版本的重复安装：不写入任何数据，但对所选载荷完整复验
   const active = await store.getActiveVersion();
-  if (active === manifest.version && (await store.getPackage(manifest.version))) {
-    return { status: 'already-active', version: manifest.version };
+  if (active === manifest.version) {
+    const installed = await store.getPackage(manifest.version);
+    if (installed) {
+      if (installed.payloadSize !== manifest.payloadSize || installed.sha256 !== manifest.sha256) {
+        throw new InstallError(
+          'VERSION_CONFLICT',
+          `版本 ${manifest.version} 已激活，但所选清单与已安装记录不符（payloadSize/sha256 不一致），拒绝覆盖`,
+        );
+      }
+      for (let i = 0; i < total; i++) {
+        const { hash } = await hashPayloadChunk(payload, i, manifest.payloadSize);
+        if (hash !== manifest.chunkHashes[i]) {
+          throw corruptChunkError(i, manifest.chunkHashes[i], hash);
+        }
+        opts.onChunk?.({ index: i, total, action: 'verified' });
+      }
+      const wholeHash = await sha256Hex(new Uint8Array(await payload.arrayBuffer()));
+      if (wholeHash !== manifest.sha256) {
+        throw new InstallError(
+          'PACKAGE_HASH_MISMATCH',
+          `整包散列不符：期望 ${manifest.sha256}，实际 ${wholeHash}。未改动任何现场。`,
+        );
+      }
+      return { status: 'already-active', version: manifest.version };
+    }
   }
 
   const staging = await store.getStaging();
@@ -94,7 +156,6 @@ export async function install(store: Store, opts: InstallOptions): Promise<Insta
     await store.setStaging({ manifest, updatedAt: new Date().toISOString() });
   }
 
-  const total = expectedChunkCount(manifest.payloadSize);
   let reused = 0;
   let written = 0;
   let rewritten = 0;
@@ -107,7 +168,7 @@ export async function install(store: Store, opts: InstallOptions): Promise<Insta
       if (storedHash === manifest.chunkHashes[i]) {
         reused++;
         opts.onChunk?.({ index: i, total, action: 'reused' });
-        if (opts.crashAfterChunk === i) {
+        if (crash === i) {
           opts.onReload?.();
           return { status: 'reloading', afterChunk: i };
         }
@@ -116,16 +177,9 @@ export async function install(store: Store, opts: InstallOptions): Promise<Insta
     }
 
     // 缺失或损坏块：从载荷切块并校验，按最小编号报告损坏
-    const start = i * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, manifest.payloadSize);
-    const buf = await payload.slice(start, end).arrayBuffer();
-    const hash = await sha256Hex(buf);
+    const { buf, hash } = await hashPayloadChunk(payload, i, manifest.payloadSize);
     if (hash !== manifest.chunkHashes[i]) {
-      throw new InstallError(
-        'CHUNK_CORRUPT',
-        `分块 ${i} 校验失败（最小损坏编号）：期望 ${manifest.chunkHashes[i]}，实际 ${hash}`,
-        i,
-      );
+      throw corruptChunkError(i, manifest.chunkHashes[i], hash);
     }
 
     // 散列通过后才以独立事务写入检查点
@@ -134,7 +188,7 @@ export async function install(store: Store, opts: InstallOptions): Promise<Insta
     else written++;
     opts.onChunk?.({ index: i, total, action: stored ? 'rewritten' : 'written' });
 
-    if (opts.crashAfterChunk === i) {
+    if (crash === i) {
       opts.onReload?.();
       return { status: 'reloading', afterChunk: i };
     }

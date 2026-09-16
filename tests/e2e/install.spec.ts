@@ -196,10 +196,11 @@ test('重复安装同一版本不产生第二份记录', async ({ page }) => {
   await page.locator('#install-btn').click();
   await expect(page.locator('#active-version')).toHaveText('v6.0.0', { timeout: 30_000 });
 
-  // 再次选择同一清单与载荷安装
+  // 再次选择同一清单与载荷安装：完整复验后提示已激活
   await selectFiles(page, manifest, payload);
   await page.locator('#install-btn').click();
-  await expect(page.locator('#log')).toContainText('已是当前激活版本，未生成第二份记录');
+  await expect(page.locator('#log')).toContainText('复验通过');
+  await expect(page.locator('#log')).toContainText('未生成第二份记录');
 
   const snap = await idbSnapshot(page);
   expect(snap.packages).toBe(1);
@@ -229,4 +230,55 @@ test('整包散列不符时不切换激活版本，修复后可续作完成', as
   await expect(page.locator('#active-version')).toHaveText('v7.0.0', { timeout: 30_000 });
   snap = await idbSnapshot(page);
   expect(snap).toMatchObject({ active: 'v7.0.0', stagingVersion: null, chunks: 0, packages: 1 });
+});
+
+test('故障注入编号不存在时明确提示，且不写入任何数据', async ({ page }) => {
+  const payload = makePayload(71, CHUNK_SIZE); // 单块包：仅第 0 块存在
+  const manifest = makeManifest(payload, 'v8.0.0');
+
+  await page.goto('/');
+  await selectFiles(page, manifest, payload);
+  await page.locator('#crash-input').fill('1');
+  await page.locator('#install-btn').click();
+
+  await expect(page.locator('#log')).toContainText('故障注入编号无效：第 1 块不存在');
+  await expect(page.locator('#active-version')).toHaveText('无');
+  await expect(page.locator('#staging-status')).toHaveText('无暂存');
+  const snap = await idbSnapshot(page);
+  expect(snap).toMatchObject({ active: null, stagingVersion: null, chunks: 0, packages: 0 });
+
+  // 清除故障注入后正常安装
+  await page.locator('#crash-input').fill('');
+  await page.locator('#install-btn').click();
+  await expect(page.locator('#active-version')).toHaveText('v8.0.0', { timeout: 30_000 });
+});
+
+test('重复安装当前版本时载荷损坏：按最小编号报告而非显示已激活', async ({ page }) => {
+  const payload = makePayload(81, FOUR_CHUNKS);
+  const manifest = makeManifest(payload, 'v9.0.0');
+
+  await page.goto('/');
+  await selectFiles(page, manifest, payload);
+  await page.locator('#install-btn').click();
+  await expect(page.locator('#active-version')).toHaveText('v9.0.0', { timeout: 30_000 });
+
+  // 再次安装同一版本，但所选载荷第 1、3 块已损坏
+  const corrupt = Buffer.from(payload);
+  corrupt[CHUNK_SIZE + 7] ^= 0xff;
+  corrupt[3 * CHUNK_SIZE + 7] ^= 0xff;
+  await selectFiles(page, manifest, corrupt);
+  await page.locator('#install-btn').click();
+
+  await expect(page.locator('#log')).toContainText('分块 1 校验失败', { timeout: 30_000 });
+  await expect(page.locator('#log')).not.toContainText('未生成第二份记录');
+  await expect(page.locator('#active-version')).toHaveText('v9.0.0');
+
+  const snap = await idbSnapshot(page);
+  expect(snap).toMatchObject({
+    active: 'v9.0.0',
+    stagingVersion: null,
+    chunks: 0,
+    packages: 1,
+    packageVersions: ['v9.0.0'],
+  });
 });
